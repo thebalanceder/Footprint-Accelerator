@@ -35,7 +35,7 @@ private:
   void optimizePose();
   void addToBA();
   void writePoseToFile(const std::vector<double>& pose);
-  bool isValidMatch(const cv::Point2f& pl, const cv::Point2f& pr) const;  // FIXED
+  bool isValidMatch(const cv::Point2f& pl, const cv::Point2f& pr) const;
 
   message_filters::Subscriber<ImageMsg> sub_left_sync_;
   message_filters::Subscriber<ImageMsg> sub_right_sync_;
@@ -59,8 +59,8 @@ private:
   std::vector<cv::DMatch> good_matches_;
 
   const double focal_ = 718.8560;
-  const double cx_    = 607.1928;
-  const double cy_    = 185.2157;
+  const double cx_ = 607.1928;
+  const double cy_ = 185.2157;
 
   std::ofstream traj_file_;
 
