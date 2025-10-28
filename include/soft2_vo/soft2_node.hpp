@@ -50,6 +50,8 @@ private:
 
   int frame_id_{0};
   double baseline_{0.54};
+  int max_keypoints_{1000}; // New member for keypoint limit
+  const int window_size_{5}; // Moved to member variable
   std::unordered_map<int, std::vector<double>> frame_poses_;
   std::unordered_map<int, rclcpp::Time> frame_stamps_;
   std::unordered_map<int, std::vector<cv::KeyPoint>> frame_kps_;

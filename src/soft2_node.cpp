@@ -2,6 +2,7 @@
 #include "soft2_vo/soft2_node.hpp"
 #include "soft2_vo/optimize_module.hpp"
 #include <iomanip>
+#include <algorithm> // For std::min_element
 
 /* ============================================================= */
 /*                     COST FUNCTORS                             */
@@ -42,8 +43,8 @@ private:
 
 struct TemporalCost {
   TemporalCost(const cv::Point2f& pt_prev, const cv::Point2f& pt_curr,
-               double focal, double cx, double cy)
-      : pt_prev_(pt_prev), pt_curr_(pt_curr), focal_(focal), cx_(cx), cy_(cy) {}
+               double focal, double cx, double cy, double weight)
+      : pt_prev_(pt_prev), pt_curr_(pt_curr), focal_(focal), cx_(cx), cy_(cy), weight_(weight) {}
 
   template <typename T>
   bool operator()(const T* const prev_t, const T* const prev_q,
@@ -87,14 +88,14 @@ struct TemporalCost {
     T dist = (epipolar_line[0] * u_curr + epipolar_line[1] * v_curr + epipolar_line[2]) /
              ceres::sqrt(epipolar_line[0] * epipolar_line[0] + epipolar_line[1] * epipolar_line[1]);
 
-    residuals[0] = dist;
+    residuals[0] = dist * T(weight_);
     residuals[1] = T(0.0);
     return true;
   }
 
 private:
   cv::Point2f pt_prev_, pt_curr_;
-  double focal_, cx_, cy_;
+  double focal_, cx_, cy_, weight_;
 };
 
 /* ============================================================= */
@@ -103,9 +104,11 @@ private:
 
 Soft2Node::Soft2Node() : Node("soft2_node") {
   declare_parameter("baseline", 0.54);
+  declare_parameter("max_keypoints", 1000); // New parameter for keypoint limit
   baseline_ = get_parameter("baseline").as_double();
+  max_keypoints_ = get_parameter("max_keypoints").as_int();
 
-  orb_ = cv::ORB::create(3000);
+  orb_ = cv::ORB::create(max_keypoints_);
   matcher_ = cv::BFMatcher::create(cv::NORM_HAMMING, true);
 
   auto qos = rclcpp::QoS(rclcpp::KeepLast(1000)).reliable();
@@ -132,53 +135,106 @@ Soft2Node::~Soft2Node() {
 }
 
 void Soft2Node::syncedCallback(const ImageMsg::ConstSharedPtr& left,
-                               const ImageMsg::ConstSharedPtr& right) {
+                               const ImageMsg::ConstSharedPtr& right)
+{
   auto start_time = std::chrono::high_resolution_clock::now();
 
-  // Use const_cast to remove constness (not ideal, but works for now; consider redesign)
-  cv_bridge::CvImageConstPtr cv_left = cv_bridge::toCvShare(left, "mono8");
+  // -----------------------------------------------------------------
+  // 1. Convert ROS images to OpenCV (mono8)
+  // -----------------------------------------------------------------
+  cv_bridge::CvImageConstPtr cv_left  = cv_bridge::toCvShare(left,  "mono8");
   cv_bridge::CvImageConstPtr cv_right = cv_bridge::toCvShare(right, "mono8");
 
-  orb_->detectAndCompute(cv_left->image, cv::noArray(), kp_left_, desc_left_);
-  orb_->detectAndCompute(cv_right->image, cv::noArray(), kp_right_, desc_right_);
+  // -----------------------------------------------------------------
+  // 2. OPTIONAL: 4x4 grid mask (only for detection, NOT for matching)
+  // -----------------------------------------------------------------
+  static cv::Mat grid_mask;
+  if (grid_mask.empty()) {
+    grid_mask = cv::Mat::zeros(cv_left->image.size(), CV_8UC1);
+    const int gs = 4;
+    const int cw = cv_left->image.cols  / gs;
+    const int ch = cv_left->image.rows  / gs;
+    for (int i = 0; i < gs; ++i)
+      for (int j = 0; j < gs; ++j)
+        grid_mask(cv::Rect(j*cw, i*ch, cw, ch)).setTo(255);
+  }
 
-  std::vector<cv::DMatch> matches;
-  matcher_->match(desc_left_, desc_right_, matches);
+  // -----------------------------------------------------------------
+  // 3. Detect + compute ORB features
+  // -----------------------------------------------------------------
+  orb_->detectAndCompute(cv_left->image,  grid_mask, kp_left_,  desc_left_);
+  orb_->detectAndCompute(cv_right->image, grid_mask, kp_right_, desc_right_);
+
+  // -----------------------------------------------------------------
+  // 4. Limit to max_keypoints_ (retain best)
+  // -----------------------------------------------------------------
+  if (kp_left_.size() > max_keypoints_) {
+    cv::KeyPointsFilter::retainBest(kp_left_, max_keypoints_);
+    desc_left_ = cv::Mat(desc_left_,
+                         cv::Range(0, static_cast<int>(kp_left_.size())),
+                         cv::Range::all()).clone();
+  }
+  if (kp_right_.size() > max_keypoints_) {
+    cv::KeyPointsFilter::retainBest(kp_right_, max_keypoints_);
+    desc_right_ = cv::Mat(desc_right_,
+                          cv::Range(0, static_cast<int>(kp_right_.size())),
+                          cv::Range::all()).clone();
+  }
+
+  // -----------------------------------------------------------------
+  // 5. Safety checks
+  // -----------------------------------------------------------------
+  assert(desc_left_.rows  == static_cast<int>(kp_left_.size()));
+  assert(desc_right_.rows == static_cast<int>(kp_right_.size()));
+  assert(desc_left_.type()  == CV_8U && desc_right_.type() == CV_8U);
+  assert(desc_left_.isContinuous() && desc_right_.isContinuous());
+
+  RCLCPP_INFO(get_logger(),
+              "Left:  kp=%zu  desc=%dx%d  (cont=%d)",
+              kp_left_.size(), desc_left_.rows, desc_left_.cols, desc_left_.isContinuous());
+  RCLCPP_INFO(get_logger(),
+              "Right: kp=%zu  desc=%dx%d  (cont=%d)",
+              kp_right_.size(), desc_right_.rows, desc_right_.cols, desc_right_.isContinuous());
+
+  // -----------------------------------------------------------------
+  // 6. Matching – K=2, NO mask, NO cross-check
+  // -----------------------------------------------------------------
+  cv::Ptr<cv::BFMatcher> matcher = cv::BFMatcher::create(cv::NORM_HAMMING);
+  std::vector<std::vector<cv::DMatch>> knn_matches;
+  matcher->knnMatch(desc_left_, desc_right_, knn_matches, 2);
 
   good_matches_.clear();
-  for (const auto& m : matches) {
-    if (m.distance < 80.0) {
-      const auto& pl = kp_left_[m.queryIdx].pt;
-      const auto& pr = kp_right_[m.trainIdx].pt;
-      if (isValidMatch(pl, pr)) good_matches_.push_back(m);
-    }
+  for (const auto& pair : knn_matches) {
+    if (pair.size() != 2) continue;
+    if (pair[0].distance > 0.7 * pair[1].distance) continue;
+    const cv::Point2f &pl = kp_left_[pair[0].queryIdx].pt;
+    const cv::Point2f &pr = kp_right_[pair[0].trainIdx].pt;
+    if (isValidMatch(pl, pr))
+        good_matches_.push_back(pair[0]);
   }
 
   if (good_matches_.size() < 10) {
-    RCLCPP_WARN(get_logger(), "Too few matches, skipping frame.");
+    RCLCPP_WARN(get_logger(),
+                "Too few good matches (%zu), skipping frame.", good_matches_.size());
     return;
   }
 
-  std::vector<std::vector<cv::DMatch>> knn_matches;
-  matcher_->knnMatch(desc_left_, desc_right_, knn_matches, 2);
-  good_matches_.clear();
-  for (const auto& m : knn_matches) {
-    if (m.size() == 2 && m[0].distance < 0.7 * m[1].distance) {
-      const auto& pl = kp_left_[m[0].queryIdx].pt;
-      const auto& pr = kp_right_[m[0].trainIdx].pt;
-      if (isValidMatch(pl, pr)) good_matches_.push_back(m[0]);
-    }
-  }
-
+  // -----------------------------------------------------------------
+  // 7. Build point vectors
+  // -----------------------------------------------------------------
   std::vector<cv::Point2f> pts_l, pts_r;
   for (const auto& m : good_matches_) {
     pts_l.push_back(kp_left_[m.queryIdx].pt);
     pts_r.push_back(kp_right_[m.trainIdx].pt);
   }
 
-  cv::Mat E = cv::findEssentialMat(pts_l, pts_r, focal_, cv::Point2d(cx_, cy_), cv::RANSAC, 0.999, 1.0);
+  // -----------------------------------------------------------------
+  // 8. Estimate Essential matrix + recover pose
+  // -----------------------------------------------------------------
+  cv::Mat E = cv::findEssentialMat(pts_l, pts_r, focal_, cv::Point2d(cx_, cy_),
+                                   cv::RANSAC, 0.999, 1.0);
   cv::Mat R, t;
-  cv::recoverPose(E, pts_l, pts_r, R, t, focal_, cv::Point2d(cx_, cy_));
+  cv::recoverPose(E, pts_l, pts_r, R, t, focal_, cv::Point2d(cx_, cy_));  // FIXED LINE
 
   double q[4];
   ceres::RotationMatrixToQuaternion(R.ptr<double>(), q);
@@ -191,8 +247,14 @@ void Soft2Node::syncedCallback(const ImageMsg::ConstSharedPtr& left,
   opt_q_[2] = q[2];
   opt_q_[3] = q[3];
 
+  // -----------------------------------------------------------------
+  // 9. Refine current pose
+  // -----------------------------------------------------------------
   optimizePose();
 
+  // -----------------------------------------------------------------
+  // 10. Store pose
+  // -----------------------------------------------------------------
   std::vector<double> pose(7);
   pose[0] = opt_t_[0];
   pose[1] = opt_t_[1];
@@ -204,17 +266,35 @@ void Soft2Node::syncedCallback(const ImageMsg::ConstSharedPtr& left,
 
   frame_poses_[frame_id_] = pose;
   frame_stamps_[frame_id_] = left->header.stamp;
-  frame_kps_[frame_id_] = kp_left_;
+  frame_kps_[frame_id_]   = kp_left_;
 
+  // -----------------------------------------------------------------
+  // 11. Bundle Adjustment
+  // -----------------------------------------------------------------
   addToBA();
   writePoseToFile(pose);
 
+  // -----------------------------------------------------------------
+  // 12. Latency
+  // -----------------------------------------------------------------
   auto end_time = std::chrono::high_resolution_clock::now();
   double latency = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count() / 1000.0;
   total_latency_ += latency;
   processed_frames_++;
 
-  RCLCPP_INFO(get_logger(), "Processed frame %d, average latency: %.2f ms", frame_id_, total_latency_ / processed_frames_);
+  RCLCPP_INFO(get_logger(),
+              "Processed frame %d, average latency: %.2f ms",
+              frame_id_, total_latency_ / processed_frames_);
+
+  // -----------------------------------------------------------------
+  // 13. Marginalization
+  // -----------------------------------------------------------------
+  if (frame_poses_.size() > window_size_ + 2) {
+    int oldest_id = frame_id_ - window_size_ - 2;
+    frame_poses_.erase(oldest_id);
+    frame_stamps_.erase(oldest_id);
+    frame_kps_.erase(oldest_id);
+  }
 
   frame_id_++;
 }
@@ -226,18 +306,19 @@ bool Soft2Node::isValidMatch(const cv::Point2f& pl, const cv::Point2f& pr) const
 void Soft2Node::optimizePose() {
   ceres::Problem prob;
 
+  double huber_threshold = 1.0 + 0.1 * (total_latency_ / processed_frames_);
   for (const auto& m : good_matches_) {
     const auto& pl = kp_left_[m.queryIdx].pt;
     const auto& pr = kp_right_[m.trainIdx].pt;
     auto* cost = new ceres::AutoDiffCostFunction<StereoCost, 2, 3, 4>(
         new StereoCost(pl.x, pl.y, pr.x, pr.y,
                        baseline_, focal_, cx_, cy_));
-    prob.AddResidualBlock(cost, new ceres::HuberLoss(1.0), opt_t_, opt_q_);
+    prob.AddResidualBlock(cost, new ceres::HuberLoss(huber_threshold), opt_t_, opt_q_);
   }
   if (prob.NumResiduals() == 0) return;
 
   ceres::Solver::Options opt;
-  opt.max_num_iterations = 100;
+  opt.max_num_iterations = std::min(100, static_cast<int>(200 / (total_latency_ / processed_frames_ + 1)));
   opt.linear_solver_type = ceres::DENSE_QR;
   ceres::Solver::Summary summary;
   ceres::Solve(opt, &prob, &summary);
@@ -248,18 +329,19 @@ void Soft2Node::addToBA() {
 
   ceres::Problem prob;
 
-  int window_size = 5;
+  int window_size = window_size_;
   for (int id = std::max(0, frame_id_ - window_size); id <= frame_id_; ++id) {
     if (!frame_poses_.count(id) || !frame_kps_.count(id)) continue;
 
     if (id == frame_id_) {
+      double huber_threshold = 1.0 + 0.1 * (total_latency_ / processed_frames_);
       for (const auto& m : good_matches_) {
         const auto& pl = kp_left_[m.queryIdx].pt;
         const auto& pr = kp_right_[m.trainIdx].pt;
         auto* cost = new ceres::AutoDiffCostFunction<StereoCost, 2, 3, 4>(
             new StereoCost(pl.x, pl.y, pr.x, pr.y,
                            baseline_, focal_, cx_, cy_));
-        prob.AddResidualBlock(cost, new ceres::HuberLoss(1.0),
+        prob.AddResidualBlock(cost, new ceres::HuberLoss(huber_threshold),
                               &frame_poses_[id][0],
                               &frame_poses_[id][3]);
       }
@@ -267,15 +349,28 @@ void Soft2Node::addToBA() {
 
     if (id > 0 && frame_kps_.count(id - 1)) {
       const auto& prev = frame_kps_[id - 1];
+      std::vector<double> weights;
       for (size_t i = 0; i < std::min(kp_left_.size(), prev.size()); ++i) {
-        auto* cost = new ceres::AutoDiffCostFunction<TemporalCost, 2, 3, 4, 3, 4>(
-            new TemporalCost(prev[i].pt, kp_left_[i].pt,
-                             focal_, cx_, cy_));
-        prob.AddResidualBlock(cost, new ceres::HuberLoss(1.0),
-                              &frame_poses_[id - 1][0],
-                              &frame_poses_[id - 1][3],
-                              &frame_poses_[id][0],
-                              &frame_poses_[id][3]);
+        cv::Point2f pt_curr = kp_left_[i].pt;
+        cv::Point2f pt_prev = prev[i].pt;
+        double dx = pt_curr.x - pt_prev.x;
+        double dy = pt_curr.y - pt_prev.y;
+        double dist = std::sqrt(dx*dx + dy*dy);
+        double weight = (dist < 50.0) ? 1.0 / (dist + 1e-6) : 0.0;
+        weights.push_back(weight);
+      }
+      double max_weight = *std::max_element(weights.begin(), weights.end());
+      for (size_t i = 0; i < std::min(kp_left_.size(), prev.size()); ++i) {
+        if (weights[i] > 0.1 * max_weight) {
+          auto* cost = new ceres::AutoDiffCostFunction<TemporalCost, 2, 3, 4, 3, 4>(
+              new TemporalCost(prev[i].pt, kp_left_[i].pt,
+                               focal_, cx_, cy_, weights[i]));
+          prob.AddResidualBlock(cost, new ceres::HuberLoss(1.0),
+                                &frame_poses_[id - 1][0],
+                                &frame_poses_[id - 1][3],
+                                &frame_poses_[id][0],
+                                &frame_poses_[id][3]);
+        }
       }
     }
   }
@@ -284,7 +379,7 @@ void Soft2Node::addToBA() {
 
   ceres::Solver::Options opt;
   opt.linear_solver_type = ceres::SPARSE_SCHUR;
-  opt.max_num_iterations = 50;
+  opt.max_num_iterations = std::min(50, static_cast<int>(100 / (total_latency_ / processed_frames_ + 1)));
   ceres::Solver::Summary summary;
   ceres::Solve(opt, &prob, &summary);
 }
