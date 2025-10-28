@@ -37,39 +37,48 @@ private:
   void writePoseToFile(const std::vector<double>& pose);
   bool isValidMatch(const cv::Point2f& pl, const cv::Point2f& pr) const;
 
+  // ----- subscribers / synchroniser -----
   message_filters::Subscriber<ImageMsg> sub_left_sync_;
   message_filters::Subscriber<ImageMsg> sub_right_sync_;
   std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
+
+  // ----- publishers / timers -----
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_;
   rclcpp::TimerBase::SharedPtr timer_;
 
+  // ----- feature handling -----
   cv::Ptr<cv::ORB> orb_;
   cv::Ptr<cv::BFMatcher> matcher_;
   std::vector<cv::KeyPoint> kp_left_, kp_right_;
   cv::Mat desc_left_, desc_right_;
 
+  // ----- bookkeeping -----
   int frame_id_{0};
   double baseline_{0.54};
-  int max_keypoints_{1000}; // New member for keypoint limit
-  const int window_size_{5}; // Moved to member variable
+  int max_keypoints_{3000};
+  int min_inliers_{10};
+  const int window_size_{5};
   std::unordered_map<int, std::vector<double>> frame_poses_;
   std::unordered_map<int, rclcpp::Time> frame_stamps_;
   std::unordered_map<int, std::vector<cv::KeyPoint>> frame_kps_;
 
+  // current-frame optimisation variables
   double opt_t_[3]{0.0, 0.0, 0.0};
   double opt_q_[4]{1.0, 0.0, 0.0, 0.0};
+
   std::vector<cv::DMatch> good_matches_;
 
+  // ----- camera intrinsics (KITTI 00-10) -----
   const double focal_ = 718.8560;
   const double cx_ = 607.1928;
   const double cy_ = 185.2157;
 
+  // ----- file output -----
   std::ofstream traj_file_;
 
+  // ----- performance stats -----
   int processed_frames_{0};
   double total_latency_{0.0};
-
-  std::vector<double> current_pose_;
 };
 
 #endif  // SOFT2_VO_SOFT2_NODE_HPP_
